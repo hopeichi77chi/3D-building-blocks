@@ -30,6 +30,16 @@ import {
   AssessmentResult,
   GroupAssignment,
   LearningReport,
+  PlayerModelSnapshot,
+  DynamicMetricStateMap,
+  PlayerModelMetricKey,
+  PlayerModelSnapshotTrigger,
+  TutorInterventionWindow,
+  ConstructionEvaluation,
+  TutorObjectiveResult,
+  TutorSelfReportedResult,
+  ResearchSessionData,
+  Position,
 } from './types';
 
 import { extractFeatures } from './engines/behaviorFeatureExtractor';
@@ -56,7 +66,7 @@ import {
   KnowledgeTracingEvidence,
 } from './engines/knowledgeTracingEngine';
 import { generateLearningReport } from './engines/learningReportEngine';
-import { assignGroup, exportEventsToCSV, exportPlayerModelToJSON, downloadTextFile } from './engines/researchModule';
+import { assignGroup, exportEventsToCSV, downloadTextFile } from './engines/researchModule';
 
 type ViewMode = 'pre-assessment' | 'path' | 'student' | 'teacher' | 'post-assessment' | 'report';
 const ABILITY_LABEL_MAP: Record<string, string> = {
@@ -140,12 +150,104 @@ function createId(): string {
     : Math.random().toString(36).slice(2, 11);
 }
 
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(1, Math.max(0, value));
+}
+
+function toPositionKey(position: Position): string {
+  return `${position.x},${position.y},${position.z}`;
+}
+
+function evaluateConstruction(
+  currentBlocks: Position[],
+  targetBlocks: Position[],
+  gridSize: number,
+): ConstructionEvaluation {
+  let bestCorrect = 0;
+  let bestIncorrect = currentBlocks.length;
+
+  for (let dx = -gridSize; dx <= gridSize; dx += 1) {
+    for (let dz = -gridSize; dz <= gridSize; dz += 1) {
+      const shiftedTarget = new Set(
+        targetBlocks.map(target =>
+          toPositionKey({ x: target.x + dx, y: target.y, z: target.z + dz }),
+        ),
+      );
+      const currentSet = new Set(currentBlocks.map(toPositionKey));
+      const correct = [...currentSet].filter(key => shiftedTarget.has(key)).length;
+      const incorrect = [...currentSet].filter(key => !shiftedTarget.has(key)).length;
+
+      if (correct > bestCorrect || (correct === bestCorrect && incorrect < bestIncorrect)) {
+        bestCorrect = correct;
+        bestIncorrect = incorrect;
+      }
+    }
+  }
+
+  const missingBlocks = Math.max(0, targetBlocks.length - bestCorrect);
+  const completionRate = targetBlocks.length === 0 ? 0 : bestCorrect / targetBlocks.length;
+  const precision = currentBlocks.length === 0 ? 0 : bestCorrect / currentBlocks.length;
+
+  return {
+    totalTargetBlocks: targetBlocks.length,
+    totalCurrentBlocks: currentBlocks.length,
+    correctBlocks: bestCorrect,
+    incorrectBlocks: bestIncorrect,
+    missingBlocks,
+    completionRate: clamp01(completionRate),
+    precision: clamp01(precision),
+    exactMatch:
+      targetBlocks.length > 0 &&
+      bestCorrect === targetBlocks.length &&
+      bestIncorrect === 0 &&
+      currentBlocks.length === targetBlocks.length,
+  };
+}
+
+function evaluateTutorOutcome(
+  before: ConstructionEvaluation,
+  after: ConstructionEvaluation,
+): {
+  result: TutorObjectiveResult;
+  improvementScore: number;
+  evidence: string[];
+} {
+  const completionGain = after.completionRate - before.completionRate;
+  const incorrectReduction = before.incorrectBlocks - after.incorrectBlocks;
+  const precisionGain = after.precision - before.precision;
+  const improvementScore = clamp01(
+    completionGain * 0.65 +
+    Math.max(0, precisionGain) * 0.2 +
+    Math.max(0, incorrectReduction) * 0.1,
+  );
+
+  let result: TutorObjectiveResult = 'NO_IMPROVEMENT';
+  if (after.exactMatch) {
+    result = 'SUCCESS';
+  } else if (completionGain >= 0.1 || incorrectReduction >= 1 || precisionGain >= 0.15) {
+    result = 'PARTIAL';
+  }
+
+  const evidence = [
+    `完成率 ${(before.completionRate * 100).toFixed(0)}% → ${(after.completionRate * 100).toFixed(0)}%`,
+    `正確積木 ${before.correctBlocks} → ${after.correctBlocks}`,
+    `錯誤積木 ${before.incorrectBlocks} → ${after.incorrectBlocks}`,
+  ];
+
+  return { result, improvementScore, evidence };
+}
+
 interface PipelineOptions {
   knowledgeObservations?: ReturnType<
     typeof createLevelKnowledgeObservations
   >;
   generateFeedback?: boolean;
   levelCompleted?: boolean;
+  triggerEventId?: string;
+  triggerType?: PlayerModelSnapshotTrigger;
+  analysisLogs?: EventLog[];
+  interventionId?: string;
 }
 
 export default function App() {
@@ -191,8 +293,12 @@ export default function App() {
   const [xaiFeedback, setXaiFeedback] = useState<XAIFeedback | null>(null);
   const [xaiResult, setXaiResult] = useState<XAIResult | null>(null);
   const [isTutorReassessing, setIsTutorReassessing] = useState(false);
-  const [modelHistory, setModelHistory] =
-    useState<(PlayerModel & { time: string })[]>([]);
+  const [playerModelHistory, setPlayerModelHistory] =
+    useState<PlayerModelSnapshot[]>([]);
+  const [activeTutorIntervention, setActiveTutorIntervention] =
+    useState<TutorInterventionWindow | null>(null);
+  const [tutorInterventionHistory, setTutorInterventionHistory] =
+    useState<TutorInterventionWindow[]>([]);
   const [learningReport, setLearningReport] =
     useState<LearningReport | null>(null);
 
@@ -202,6 +308,9 @@ export default function App() {
   const playerModelRef = useRef<PlayerModel>(playerModel);
   const knowledgeStateRef =
     useRef<KnowledgeTracingState>(knowledgeState);
+  const blocksRef = useRef<Block[]>(blocks);
+  const activeTutorInterventionRef =
+    useRef<TutorInterventionWindow | null>(activeTutorIntervention);
 
   useEffect(() => {
     logsRef.current = logs;
@@ -214,6 +323,14 @@ export default function App() {
   useEffect(() => {
     knowledgeStateRef.current = knowledgeState;
   }, [knowledgeState]);
+
+  useEffect(() => {
+    blocksRef.current = blocks;
+  }, [blocks]);
+
+  useEffect(() => {
+    activeTutorInterventionRef.current = activeTutorIntervention;
+  }, [activeTutorIntervention]);
 
   // ==========================================================================
   // Complete AI Pipeline
@@ -230,8 +347,9 @@ export default function App() {
     newLogs: EventLog[],
     options: PipelineOptions = {},
   ) => {
-    const features = extractFeatures(newLogs);
-    const vector = recognizeBehaviorVector(newLogs, features);
+    const analysisLogs = options.analysisLogs ?? newLogs;
+    const features = extractFeatures(analysisLogs);
+    const vector = recognizeBehaviorVector(analysisLogs, features);
     const diags = diagnose(vector, features);
 
     let nextKnowledgeState = knowledgeStateRef.current;
@@ -257,12 +375,14 @@ export default function App() {
       setKnowledgeEvidence(nextKnowledgeEvidence);
     }
 
+    const previousModel = playerModelRef.current;
+
     const playerModelResult = inferPlayerModel({
       features,
       behaviorVector: vector,
       diagnoses: diags,
       knowledgeState: nextKnowledgeState,
-      previousPlayerModel: playerModelRef.current,
+      previousPlayerModel: previousModel,
     });
 
     const nextModel = playerModelResult.playerModel;
@@ -297,6 +417,59 @@ export default function App() {
     setPlayerModelConfidence(playerModelResult.overallConfidence);
     setDecisionResult(nextDecisionResult);
     setDecision(nextDecision);
+
+    const metricStates: DynamicMetricStateMap = {};
+    playerModelResult.predictions.forEach(prediction => {
+      const metric = prediction.metric as PlayerModelMetricKey;
+      const previousSnapshot = [...playerModelHistory]
+        .reverse()
+        .find(item => item.metricStates[metric])
+        ?.metricStates[metric];
+
+      metricStates[metric] = {
+        metric,
+        value: prediction.updatedValue,
+        previousValue: prediction.previousValue,
+        change: prediction.delta,
+        confidence: prediction.confidence,
+        trend:
+          prediction.delta > 0.01
+            ? 'UP'
+            : prediction.delta < -0.01
+              ? 'DOWN'
+              : 'STABLE',
+        observations: (previousSnapshot?.observations ?? 0) + 1,
+        lastUpdatedAt: Date.now(),
+        evidenceIds: prediction.evidence.map((_, index) =>
+          `${prediction.metric}-${Date.now()}-${index}`,
+        ),
+        evidenceSummary: prediction.evidence.map(item =>
+          `${item.label}: ${(item.value * 100).toFixed(0)}% × ${item.weight.toFixed(2)}`,
+        ),
+      };
+    });
+
+    const snapshot: PlayerModelSnapshot = {
+      id: createId(),
+      timestamp: Date.now(),
+      participantId,
+      levelId: currentLevel.id,
+      triggerEventId: options.triggerEventId,
+      triggerType: options.triggerType ?? 'GAME_EVENT',
+      model: { ...nextModel, knowledgeMastery: [...nextModel.knowledgeMastery] },
+      metricStates,
+      diagnoses: diags,
+      behaviorFeatures: features,
+      behaviorVector: vector,
+      overallConfidence: playerModelResult.overallConfidence,
+      previousMastery: previousModel.masteryLevel,
+      currentMastery: nextModel.masteryLevel,
+      masteryChange: nextModel.masteryLevel - previousModel.masteryLevel,
+      decisionRuleId: nextDecision.ruleId,
+      interventionId: options.interventionId,
+    };
+
+    setPlayerModelHistory(history => [...history, snapshot]);
 
     if (options.generateFeedback) {
       const detailedXAI = generateDetailedXAI({
@@ -367,32 +540,17 @@ export default function App() {
     type: EventType,
     payload: unknown,
   ): void => {
-    const { updatedLogs } = appendEvent(type, payload);
+    const { event, updatedLogs } = appendEvent(type, payload);
 
     if (updatedLogs.length >= 2) {
-      runPipeline(updatedLogs);
+      runPipeline(updatedLogs, {
+        triggerEventId: event.id,
+        triggerType: 'GAME_EVENT',
+      });
     }
   };
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setModelHistory(hist => [
-        ...hist,
-        {
-          ...playerModel,
-          mentalRotation: playerModel.mentalRotation * 100,
-          spatialVisualization: playerModel.spatialVisualization * 100,
-          perspectiveTaking: playerModel.perspectiveTaking * 100,
-          planning: playerModel.planning * 100,
-          workingMemory: playerModel.workingMemory * 100,
-          persistence: playerModel.persistence * 100,
-          confidence: playerModel.confidence * 100,
-          time: new Date().toLocaleTimeString(),
-        },
-      ]);
-    }, 15000);
-    return () => clearInterval(interval);
-  }, [playerModel]);
+  // Player Model 歷程改由 runPipeline 事件驅動建立，避免固定時間重複取樣。
 
   // --- Adaptive Learning Path ---
   const nextRecommendedLevel = useMemo(() => {
@@ -416,6 +574,8 @@ export default function App() {
 
     const pipeline = runPipeline(updatedLogs, {
       generateFeedback: true,
+      triggerEventId: updatedLogs[0]?.id,
+      triggerType: 'HINT_INTERVENTION',
     });
 
     // 將幾何差異加入學生可操作提示
@@ -543,6 +703,8 @@ export default function App() {
         knowledgeObservations: observations,
         generateFeedback: true,
         levelCompleted: true,
+        triggerEventId: event.id,
+        triggerType: 'LEVEL_COMPLETED',
       });
 
       if (nextCompleted.length === LEVEL_POOL.length) {
@@ -567,11 +729,45 @@ export default function App() {
     cycle: number,
     hint: string,
   ): void => {
-    logEvent('HINT_READ', {
+    const startedAt = Date.now();
+    const beforeFeatures = extractFeatures(logsRef.current);
+    const beforePositions = blocksRef.current.map(({ x, y, z }) => ({ x, y, z }));
+    const beforeEvaluation = evaluateConstruction(
+      beforePositions,
+      currentLevel.targets,
+      currentLevel.gridSize,
+    );
+
+    const intervention: TutorInterventionWindow = {
+      id: createId(),
+      cycle,
+      levelId: currentLevel.id,
+      startedAt,
+      startEventIndex: logsRef.current.length,
+      hint,
+      hintLevel: cycle >= 3 ? 3 : cycle === 2 ? 2 : 1,
+      hintType: decision?.hintType,
+      beforeFeatures,
+      beforeBlockPositions: beforePositions,
+      beforeEvaluation,
+    };
+
+    activeTutorInterventionRef.current = intervention;
+    setActiveTutorIntervention(intervention);
+
+    appendEvent('TUTOR_INTERVENTION_START', {
+      interventionId: intervention.id,
+      cycle,
+      levelId: currentLevel.id,
+      hint,
+    });
+
+    appendEvent('HINT_READ', {
+      interventionId: intervention.id,
       cycle,
       hint,
       levelId: currentLevel.id,
-      readAt: Date.now(),
+      readAt: startedAt,
     });
   };
 
@@ -581,69 +777,102 @@ export default function App() {
     setIsTutorReassessing(true);
 
     try {
-      const success = payload.result === 'SUCCESS';
-      const eventType: EventType = success
-        ? 'PLACE_SUCCESS'
-        : payload.result === 'STILL_STUCK'
-          ? 'ERROR'
-          : 'SUBMIT';
-
-      const { event, updatedLogs } = appendEvent(
-        eventType,
-        {
-          tutorCycle: payload.cycle,
-          tutorObservation: payload.result,
-          reflectionAnswer: payload.reflectionAnswer,
-          diagnosisRuleId: payload.diagnosis?.ruleId,
-          success,
-          partial: payload.result === 'PARTIAL',
-          completed: success,
-          levelId: currentLevel.id,
-        },
+      const intervention = activeTutorInterventionRef.current;
+      const selfReportedResult = payload.result as TutorSelfReportedResult;
+      const endedAt = Date.now();
+      const afterPositions = blocksRef.current.map(({ x, y, z }) => ({ x, y, z }));
+      const afterEvaluation = evaluateConstruction(
+        afterPositions,
+        currentLevel.targets,
+        currentLevel.gridSize,
       );
 
-      const preliminaryFeatures =
-        extractFeatures(updatedLogs);
+      const fallbackBeforeFeatures = extractFeatures(logsRef.current);
+      const effectiveIntervention: TutorInterventionWindow =
+        intervention ?? {
+          id: createId(),
+          cycle: payload.cycle,
+          levelId: currentLevel.id,
+          startedAt: endedAt,
+          startEventIndex: logsRef.current.length,
+          hint: payload.hint,
+          hintLevel: payload.cycle >= 3 ? 3 : payload.cycle === 2 ? 2 : 1,
+          beforeFeatures: fallbackBeforeFeatures,
+          beforeBlockPositions: afterPositions,
+          beforeEvaluation: afterEvaluation,
+        };
 
-      const observations =
-        createLevelKnowledgeObservations({
-          primarySkill:
-            currentLevel.primarySkill,
-          secondarySkills: [
-            'planning',
-            'workingMemory',
-          ],
-          success,
-          difficulty:
-            currentLevel.difficulty,
-          hintUsed: true,
-          hintLevel:
-            payload.cycle >= 3
-              ? 3
-              : payload.cycle === 2
-                ? 2
-                : 1,
-          completionRate:
-            success
-              ? 1
-              : preliminaryFeatures.completionRate,
-          score:
-            success
-              ? 1
-              : preliminaryFeatures.successRate,
-          levelId:
-            currentLevel.id,
-          observationId:
-            event.id,
-          timestamp:
-            event.timestamp,
-        });
+      const windowLogs = logsRef.current
+        .filter(log => log.timestamp >= effectiveIntervention.startedAt)
+        .sort((a, b) => a.timestamp - b.timestamp);
+      const afterFeatures = extractFeatures(windowLogs);
+      const beforeEvaluation =
+        effectiveIntervention.beforeEvaluation ??
+        evaluateConstruction(
+          effectiveIntervention.beforeBlockPositions,
+          currentLevel.targets,
+          currentLevel.gridSize,
+        );
+      const outcome = evaluateTutorOutcome(beforeEvaluation, afterEvaluation);
+
+      const { event, updatedLogs } = appendEvent('TUTOR_REASSESSMENT', {
+        interventionId: effectiveIntervention.id,
+        tutorCycle: payload.cycle,
+        selfReportedResult,
+        objectiveResult: outcome.result,
+        improvementScore: outcome.improvementScore,
+        evidence: outcome.evidence,
+        reflectionAnswer: payload.reflectionAnswer,
+        diagnosisRuleId: payload.diagnosis?.ruleId,
+        levelId: currentLevel.id,
+      });
+
+      const completedIntervention: TutorInterventionWindow = {
+        ...effectiveIntervention,
+        endedAt,
+        endEventIndex: updatedLogs.length,
+        afterFeatures,
+        afterBlockPositions: afterPositions,
+        afterEvaluation,
+        objectiveResult: outcome.result,
+        selfReportedResult,
+        improvementScore: outcome.improvementScore,
+        evidence: outcome.evidence,
+      };
+
+      setTutorInterventionHistory(history => [
+        ...history,
+        completedIntervention,
+      ]);
+      activeTutorInterventionRef.current = null;
+      setActiveTutorIntervention(null);
+
+      const objectiveSuccess = outcome.result === 'SUCCESS';
+      const observations = createLevelKnowledgeObservations({
+        primarySkill: currentLevel.primarySkill,
+        secondarySkills: ['planning', 'workingMemory'],
+        success: objectiveSuccess,
+        difficulty: currentLevel.difficulty,
+        hintUsed: true,
+        hintLevel: completedIntervention.hintLevel,
+        completionRate: afterEvaluation.completionRate,
+        score: clamp01(
+          afterEvaluation.completionRate * 0.7 +
+          afterEvaluation.precision * 0.3,
+        ),
+        levelId: currentLevel.id,
+        observationId: event.id,
+        timestamp: event.timestamp,
+      });
 
       runPipeline(updatedLogs, {
-        knowledgeObservations:
-          observations,
+        knowledgeObservations: observations,
         generateFeedback: true,
-        levelCompleted: success,
+        levelCompleted: objectiveSuccess,
+        triggerEventId: event.id,
+        triggerType: 'TUTOR_REASSESSMENT',
+        analysisLogs: windowLogs.length > 0 ? windowLogs : updatedLogs,
+        interventionId: completedIntervention.id,
       });
     } finally {
       setIsTutorReassessing(false);
@@ -661,8 +890,27 @@ export default function App() {
 
   // --- Research Export ---
   const handleExportEvents = () => downloadTextFile(`${participantId}_events.csv`, exportEventsToCSV(logs), 'text/csv');
-  const handleExportModel = () => downloadTextFile(`${participantId}_playermodel.json`,
-    exportPlayerModelToJSON(playerModel, [preTestResult, postTestResult].filter(Boolean) as AssessmentResult[]), 'application/json');
+  const handleExportModel = () => {
+    const researchData: ResearchSessionData = {
+      schemaVersion: '3.0',
+      exportedAt: Date.now(),
+      participantId,
+      group,
+      events: logs,
+      assessments: [preTestResult, postTestResult].filter(Boolean) as AssessmentResult[],
+      finalPlayerModel: playerModel,
+      playerModelHistory,
+      tutorInterventions: tutorInterventionHistory,
+      completedLevelIds: completedLevels,
+      metadata: { currentLevelId, playerModelConfidence },
+    };
+
+    downloadTextFile(
+      `${participantId}_research-session.json`,
+      JSON.stringify(researchData, null, 2),
+      'application/json',
+    );
+  };
 
   const finishExperiment = () => {
     const report = generateLearningReport(playerModel, diagnoses, completedLevels, logs);
@@ -1058,7 +1306,13 @@ export default function App() {
                 <h3 className="font-bold text-slate-800 mb-4 flex items-center"><TrendingUp className="w-5 h-5 mr-2 text-blue-600" /> 認知發展軌跡與系統信心 (Timeline)</h3>
                 <div className="h-64 w-full">
                   <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={modelHistory} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
+                    <LineChart data={playerModelHistory.map(snapshot => ({
+                      time: new Date(snapshot.timestamp).toLocaleTimeString(),
+                      spatialVisualization: snapshot.model.spatialVisualization * 100,
+                      perspectiveTaking: snapshot.model.perspectiveTaking * 100,
+                      planning: snapshot.model.planning * 100,
+                      confidence: snapshot.overallConfidence * 100,
+                    }))} margin={{ top: 5, right: 20, bottom: 5, left: 0 }}>
                       <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" />
                       <XAxis dataKey="time" tick={{ fill: '#94a3b8', fontSize: 11 }} />
                       <YAxis domain={[0, 100]} tick={{ fill: '#94a3b8', fontSize: 11 }} />

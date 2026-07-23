@@ -3,7 +3,10 @@ import {
   BehaviorFeatures,
   BehaviorVector,
   CognitiveDiagnosis,
+  DynamicMetricStateMap,
+  LearningTrend,
   PlayerModel,
+  PlayerModelMetricKey,
 } from '../types';
 
 import type {
@@ -43,21 +46,7 @@ import {
 /**
  * PlayerModel 中所有數值型的推論欄位。
  */
-export type PlayerModelMetric =
-  | AbilityKey
-  | 'hintDependency'
-  | 'confidence'
-  | 'exploration'
-  | 'efficiency'
-  | 'helpSeeking'
-  | 'reflection'
-  | 'impulsiveness'
-  | 'selfRegulation'
-  | 'cognitiveLoad'
-  | 'engagement'
-  | 'motivation'
-  | 'masteryLevel'
-  | 'predictedSuccessRate';
+export type PlayerModelMetric = PlayerModelMetricKey;
 
 /**
  * 推論模型種類。
@@ -143,6 +132,12 @@ export interface PlayerModelInferenceResult {
   predictions: PlayerMetricPrediction[];
 
   /**
+   * 每項玩家模型指標的動態狀態。
+   * 包含趨勢、信心、觀察次數與證據追蹤。
+   */
+  metricStates: DynamicMetricStateMap;
+
+  /**
    * 整體模型信心，0～1。
    */
   overallConfidence: number;
@@ -169,6 +164,12 @@ export interface PlayerModelInferenceInput {
   diagnoses?: CognitiveDiagnosis[];
   knowledgeState?: KnowledgeTracingState;
   previousPlayerModel?: PlayerModel;
+
+  /**
+   * 上一次推論留下的動態指標狀態。
+   * 若未提供，觀察次數會由 1 開始。
+   */
+  previousMetricStates?: DynamicMetricStateMap;
 }
 
 /**
@@ -1677,6 +1678,63 @@ function createMetricPrediction(params: {
   };
 }
 
+/**
+ * 根據本次推論結果建立 Dynamic Player Model 狀態。
+ *
+ * 此函式可直接供 App.tsx、研究匯出模組與 Dashboard 使用，
+ * 避免各處自行重複計算趨勢、觀察次數與證據摘要。
+ */
+export function createDynamicMetricStates(
+  predictions: PlayerMetricPrediction[],
+  previousMetricStates: DynamicMetricStateMap = {},
+  generatedAt = Date.now(),
+): DynamicMetricStateMap {
+  const states: DynamicMetricStateMap = {};
+
+  for (const prediction of predictions) {
+    const metric = prediction.metric;
+    const previousState = previousMetricStates[metric];
+
+    const trend: LearningTrend =
+      prediction.delta > 0.01
+        ? 'UP'
+        : prediction.delta < -0.01
+          ? 'DOWN'
+          : 'STABLE';
+
+    const evidenceIds = prediction.evidence.map((evidence, index) =>
+      [
+        metric,
+        generatedAt,
+        evidence.source.replace(/[^a-zA-Z0-9_.-]/g, '_'),
+        index,
+      ].join('-'),
+    );
+
+    states[metric] = {
+      metric,
+      value: clamp(prediction.updatedValue),
+      previousValue: clamp(prediction.previousValue),
+      change: round(prediction.delta),
+      confidence: clamp(prediction.confidence),
+      trend,
+      observations: Math.max(1, (previousState?.observations ?? 0) + 1),
+      lastUpdatedAt: generatedAt,
+      evidenceIds,
+      evidenceSummary: prediction.evidence.map(evidence => {
+        const direction = evidence.direction === 'negative' ? '負向' : '正向';
+        return (
+          `${evidence.label}（${direction}）：` +
+          `${formatPercent(evidence.value)} × ` +
+          `權重 ${round(evidence.weight, 3)}`
+        );
+      }),
+    };
+  }
+
+  return states;
+}
+
 function getPredictionValue(
   predictions: PlayerMetricPrediction[],
   metric: PlayerModelMetric,
@@ -2399,9 +2457,17 @@ implements PlayerModelPredictor {
             prediction.confidence,
         );
 
+    const generatedAt = Date.now();
+    const metricStates = createDynamicMetricStates(
+      predictions,
+      input.previousMetricStates,
+      generatedAt,
+    );
+
     return {
       playerModel,
       predictions,
+      metricStates,
       overallConfidence:
         round(
           average(
@@ -2409,7 +2475,7 @@ implements PlayerModelPredictor {
           ),
         ),
       predictorType: this.type,
-      generatedAt: Date.now(),
+      generatedAt,
       modelVersion: this.version,
     };
   }
