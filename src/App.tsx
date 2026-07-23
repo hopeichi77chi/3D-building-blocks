@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Box, Eye, BrainCircuit, Activity, Trash2, CheckCircle,
   BarChart3, Database, User, BookOpen, Undo2, Play,
@@ -11,28 +11,142 @@ import {
 
 import { Scene3D } from './components/Scene3D';
 import { AssessmentModal } from './components/AssessmentModal';
-import { TutorPanel } from './components/TutorPanel';
+import {
+  TutorPanel,
+  TutorObservationPayload,
+} from './components/TutorPanel';
 import { LEVEL_POOL } from './data/levels';
 import {
-  Block, EventLog, EventType, PlayerModel, BehaviorFeatures, BehaviorPattern,
-  CognitiveDiagnosis, AdaptiveDecision, XAIFeedback, ModelUpdateEvidence,
-  AssessmentResult, GroupAssignment, LearningReport,
+  Block,
+  EventLog,
+  EventType,
+  PlayerModel,
+  BehaviorFeatures,
+  BehaviorVector,
+  CognitiveDiagnosis,
+  AdaptiveDecision,
+  XAIFeedback,
+  XAIResult,
+  AssessmentResult,
+  GroupAssignment,
+  LearningReport,
 } from './types';
 
 import { extractFeatures } from './engines/behaviorFeatureExtractor';
-import { recognizePatterns } from './engines/behaviorPatternRecognizer';
+import { recognizeBehaviorVector } from './engines/behaviorPatternRecognizer';
 import { diagnose } from './engines/cognitiveDiagnosisEngine';
-import { updatePlayerModel, INITIAL_PLAYER_MODEL } from './engines/playerModelEngine';
-import { decide, selectNextLevel } from './engines/adaptiveDecisionEngine';
-import { generateXAI } from './engines/xaiEngine';
+import {
+  createInitialPlayerModel,
+  inferPlayerModel,
+  PlayerMetricPrediction,
+} from './engines/machineLearningPlayerModel';
+import {
+  decideWithEvidence,
+  selectNextLevel,
+  AdaptiveDecisionResult,
+} from './engines/adaptiveDecisionEngine';
+import {
+  generateDetailedXAI,
+} from './engines/xaiEngine';
+import {
+  createInitialKnowledgeState,
+  createLevelKnowledgeObservations,
+  updateMultipleKnowledgeStates,
+  KnowledgeTracingState,
+  KnowledgeTracingEvidence,
+} from './engines/knowledgeTracingEngine';
 import { generateLearningReport } from './engines/learningReportEngine';
 import { assignGroup, exportEventsToCSV, exportPlayerModelToJSON, downloadTextFile } from './engines/researchModule';
 
 type ViewMode = 'pre-assessment' | 'path' | 'student' | 'teacher' | 'post-assessment' | 'report';
 const ABILITY_LABEL_MAP: Record<string, string> = {
-  mentalRotation: '心理旋轉', spatialVisualization: '空間視覺化', perspectiveTaking: '視角轉換',
-  planning: '邏輯規劃', workingMemory: '工作記憶', persistence: '堅持度',
+  mentalRotation: '心理旋轉',
+  spatialVisualization: '空間視覺化',
+  perspectiveTaking: '視角轉換',
+  planning: '邏輯規劃',
+  workingMemory: '工作記憶',
+  persistence: '堅持度',
 };
+
+const ABILITY_KEYS = [
+  'mentalRotation',
+  'spatialVisualization',
+  'perspectiveTaking',
+  'planning',
+  'workingMemory',
+  'persistence',
+] as const;
+
+const EMPTY_BEHAVIOR_FEATURES: BehaviorFeatures = {
+  planningTime: 0,
+  idleTime: 0,
+  errorRate: 0,
+  retryRate: 0,
+  rotationFrequency: 0,
+  viewSwitchFrequency: 0,
+  constructionSpeed: 0,
+  hintDependencyRate: 0,
+  constructionOrderScore: 0.5,
+  totalTime: 0,
+  averageResponseTime: 0,
+  firstCorrectTime: 0,
+  totalErrors: 0,
+  totalRetries: 0,
+  successRate: 0,
+  completionRate: 0,
+  cameraRotationCount: 0,
+  cameraZoomCount: 0,
+  cameraMoveCount: 0,
+  averageRotationAngle: 0,
+  averageZoomDistance: 0,
+  blockPlacementCount: 0,
+  blockMoveCount: 0,
+  blockRotationCount: 0,
+  blockRemovalCount: 0,
+  blockReplacementCount: 0,
+  undoCount: 0,
+  redoCount: 0,
+  hintRequestCount: 0,
+  hintReadingTime: 0,
+  hoverTime: 0,
+  dragDistance: 0,
+  explorationDistance: 0,
+  attentionSwitchCount: 0,
+  perspectiveChangeCount: 0,
+  sequenceConsistency: 0.5,
+  planningScore: 0.5,
+  explorationScore: 0.5,
+  persistenceScore: 0.5,
+  efficiencyScore: 0.5,
+  confidenceScore: 0.5,
+  helpSeekingScore: 0,
+  cognitiveLoadEstimate: 0.5,
+};
+
+const EMPTY_BEHAVIOR_VECTOR: BehaviorVector = {
+  exploration: 0.5,
+  planning: 0.5,
+  persistence: 0.5,
+  confidence: 0.5,
+  impulsiveness: 0.5,
+  efficiency: 0.5,
+  helpSeeking: 0,
+  reflection: 0.5,
+};
+
+function createId(): string {
+  return typeof crypto !== 'undefined' && 'randomUUID' in crypto
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2, 11);
+}
+
+interface PipelineOptions {
+  knowledgeObservations?: ReturnType<
+    typeof createLevelKnowledgeObservations
+  >;
+  generateFeedback?: boolean;
+  levelCompleted?: boolean;
+}
 
 export default function App() {
   // --- Research / Session Setup ---
@@ -53,57 +167,229 @@ export default function App() {
   const [isSuccess, setIsSuccess] = useState(false);
 
   // --- AI Reasoning Pipeline State ---
-  // Event -> Feature -> Pattern -> Diagnosis -> Player Model -> Decision -> XAI
-  const [behaviorFeatures, setBehaviorFeatures] = useState<BehaviorFeatures>({
-    planningTime: 0, idleTime: 0, errorRate: 0, retryRate: 0, rotationFrequency: 0,
-    viewSwitchFrequency: 0, constructionSpeed: 0, hintDependencyRate: 0, constructionOrderScore: 0.5,
-  });
-  const [patterns, setPatterns] = useState<BehaviorPattern[]>([]);
+  // Event → Feature → Behavior Vector → Probability Diagnosis
+  // → Knowledge Tracing → ML Player Model → Decision Table → XAI
+  const [behaviorFeatures, setBehaviorFeatures] =
+    useState<BehaviorFeatures>(EMPTY_BEHAVIOR_FEATURES);
+  const [behaviorVector, setBehaviorVector] =
+    useState<BehaviorVector>(EMPTY_BEHAVIOR_VECTOR);
   const [diagnoses, setDiagnoses] = useState<CognitiveDiagnosis[]>([]);
-  const [playerModel, setPlayerModel] = useState<PlayerModel>(INITIAL_PLAYER_MODEL);
-  const [evidenceTrail, setEvidenceTrail] = useState<ModelUpdateEvidence[]>([]);
+  const [knowledgeState, setKnowledgeState] =
+    useState<KnowledgeTracingState>(() =>
+      createInitialKnowledgeState(participantId),
+    );
+  const [knowledgeEvidence, setKnowledgeEvidence] =
+    useState<KnowledgeTracingEvidence[]>([]);
+  const [playerModel, setPlayerModel] =
+    useState<PlayerModel>(() => createInitialPlayerModel());
+  const [modelPredictions, setModelPredictions] =
+    useState<PlayerMetricPrediction[]>([]);
+  const [playerModelConfidence, setPlayerModelConfidence] = useState(0);
+  const [decisionResult, setDecisionResult] =
+    useState<AdaptiveDecisionResult | null>(null);
   const [decision, setDecision] = useState<AdaptiveDecision | null>(null);
   const [xaiFeedback, setXaiFeedback] = useState<XAIFeedback | null>(null);
-  const [modelHistory, setModelHistory] = useState<(PlayerModel & { time: string })[]>([]);
-  const [learningReport, setLearningReport] = useState<LearningReport | null>(null);
+  const [xaiResult, setXaiResult] = useState<XAIResult | null>(null);
+  const [isTutorReassessing, setIsTutorReassessing] = useState(false);
+  const [modelHistory, setModelHistory] =
+    useState<(PlayerModel & { time: string })[]>([]);
+  const [learningReport, setLearningReport] =
+    useState<LearningReport | null>(null);
 
   const currentLevel = useMemo(() => LEVEL_POOL.find(l => l.id === currentLevelId) || LEVEL_POOL[0], [currentLevelId]);
 
-  // ==========================================================================
-  // AI Reasoning Pipeline — 對應「程式碼還需改進方向.docx」補齊之完整資料流：
-  // Event Log -> Behavior Feature Extraction -> Behavior Pattern Recognition
-  //   -> Cognitive Diagnosis -> Player Model Update -> Adaptive Decision -> XAI
-  // ==========================================================================
-  const runPipeline = (newLogs: EventLog[]) => {
-    const sessionEventCount = newLogs.findIndex(l => l.type === 'SESSION_START') + 1 || newLogs.length;
+  const logsRef = useRef<EventLog[]>(logs);
+  const playerModelRef = useRef<PlayerModel>(playerModel);
+  const knowledgeStateRef =
+    useRef<KnowledgeTracingState>(knowledgeState);
 
+  useEffect(() => {
+    logsRef.current = logs;
+  }, [logs]);
+
+  useEffect(() => {
+    playerModelRef.current = playerModel;
+  }, [playerModel]);
+
+  useEffect(() => {
+    knowledgeStateRef.current = knowledgeState;
+  }, [knowledgeState]);
+
+  // ==========================================================================
+  // Complete AI Pipeline
+  //
+  // 一般事件：
+  // Event → Feature → Behavior Vector → Diagnosis → Player Model → Decision
+  //
+  // 關卡完成／Tutor 回報：
+  // Event → Feature → Behavior Vector → Diagnosis → Knowledge Tracing
+  // → Player Model → Decision → XAI
+  // ==========================================================================
+
+  const runPipeline = (
+    newLogs: EventLog[],
+    options: PipelineOptions = {},
+  ) => {
     const features = extractFeatures(newLogs);
-    const pats = recognizePatterns(newLogs, features);
-    const diags = diagnose(pats, features);
-    const { model, evidenceTrail: trail } = updatePlayerModel(playerModel, features, diags, sessionEventCount);
-    const dec = decide(model, diags);
+    const vector = recognizeBehaviorVector(newLogs, features);
+    const diags = diagnose(vector, features);
+
+    let nextKnowledgeState = knowledgeStateRef.current;
+    let nextKnowledgeEvidence: KnowledgeTracingEvidence[] = [];
+
+    if (
+      options.knowledgeObservations &&
+      options.knowledgeObservations.length > 0
+    ) {
+      const tracingResult = updateMultipleKnowledgeStates(
+        knowledgeStateRef.current,
+        options.knowledgeObservations,
+        features,
+        vector,
+        diags,
+      );
+
+      nextKnowledgeState = tracingResult.state;
+      nextKnowledgeEvidence = tracingResult.updates;
+
+      knowledgeStateRef.current = nextKnowledgeState;
+      setKnowledgeState(nextKnowledgeState);
+      setKnowledgeEvidence(nextKnowledgeEvidence);
+    }
+
+    const playerModelResult = inferPlayerModel({
+      features,
+      behaviorVector: vector,
+      diagnoses: diags,
+      knowledgeState: nextKnowledgeState,
+      previousPlayerModel: playerModelRef.current,
+    });
+
+    const nextModel = playerModelResult.playerModel;
+
+    const nextDecisionResult = decideWithEvidence(
+      nextModel,
+      diags,
+      {
+        currentLevel,
+        levelCompleted: options.levelCompleted,
+        hintUsed: features.hintRequestCount > 0,
+        hintRequestCount: features.hintRequestCount,
+      },
+    );
+
+    const nextDecision = nextDecisionResult.decision;
+
+    const recommendedLevel = selectNextLevel(
+      nextDecision,
+      nextModel,
+      LEVEL_POOL,
+      completedLevels,
+      currentLevel,
+    );
 
     setBehaviorFeatures(features);
-    setPatterns(pats);
+    setBehaviorVector(vector);
     setDiagnoses(diags);
-    setPlayerModel(model);
-    setEvidenceTrail(trail);
-    setDecision(dec);
-    return { features, pats, diags, model, dec };
+    playerModelRef.current = nextModel;
+    setPlayerModel(nextModel);
+    setModelPredictions(playerModelResult.predictions);
+    setPlayerModelConfidence(playerModelResult.overallConfidence);
+    setDecisionResult(nextDecisionResult);
+    setDecision(nextDecision);
+
+    if (options.generateFeedback) {
+      const detailedXAI = generateDetailedXAI({
+        diagnoses: diags,
+        decision: nextDecision,
+        features,
+        model: nextModel,
+        behaviorVector: vector,
+        context: {
+          levelCompleted: options.levelCompleted,
+          currentLevelId: currentLevel.id,
+          currentLevelName: currentLevel.name,
+          currentDifficulty: currentLevel.difficulty,
+          recommendedLevelId: recommendedLevel?.id,
+          recommendedLevelName: recommendedLevel?.name,
+          nextDifficulty: recommendedLevel?.difficulty,
+          decisionMatchingScore:
+            nextDecisionResult.selectedRule.matchingScore,
+          playerModelConfidence:
+            playerModelResult.overallConfidence,
+          knowledgeTracingEnabled: true,
+        },
+      });
+
+      setXaiFeedback(detailedXAI.feedback);
+      setXaiResult(detailedXAI.result);
+    }
+
+    return {
+      features,
+      behaviorVector: vector,
+      diagnoses: diags,
+      knowledgeState: nextKnowledgeState,
+      knowledgeEvidence: nextKnowledgeEvidence,
+      playerModel: nextModel,
+      playerModelResult,
+      decision: nextDecision,
+      decisionResult: nextDecisionResult,
+      recommendedLevel,
+    };
   };
 
-  const logEvent = (type: EventType, payload: any) => {
-    const newLog: EventLog = { id: Math.random().toString(36).substr(2, 9), timestamp: Date.now(), type, payload };
-    setLogs(prev => {
-      const updated = [newLog, ...prev];
-      if (updated.length >= 2) runPipeline(updated);
-      return updated;
-    });
+  const appendEvent = (
+    type: EventType,
+    payload: unknown,
+  ): {
+    event: EventLog;
+    updatedLogs: EventLog[];
+  } => {
+    const event: EventLog = {
+      id: createId(),
+      timestamp: Date.now(),
+      type,
+      payload,
+    };
+
+    const updatedLogs = [event, ...logsRef.current];
+    logsRef.current = updatedLogs;
+    setLogs(updatedLogs);
+
+    return {
+      event,
+      updatedLogs,
+    };
+  };
+
+  const logEvent = (
+    type: EventType,
+    payload: unknown,
+  ): void => {
+    const { updatedLogs } = appendEvent(type, payload);
+
+    if (updatedLogs.length >= 2) {
+      runPipeline(updatedLogs);
+    }
   };
 
   useEffect(() => {
     const interval = setInterval(() => {
-      setModelHistory(hist => [...hist, { ...playerModel, time: new Date().toLocaleTimeString() }]);
+      setModelHistory(hist => [
+        ...hist,
+        {
+          ...playerModel,
+          mentalRotation: playerModel.mentalRotation * 100,
+          spatialVisualization: playerModel.spatialVisualization * 100,
+          perspectiveTaking: playerModel.perspectiveTaking * 100,
+          planning: playerModel.planning * 100,
+          workingMemory: playerModel.workingMemory * 100,
+          persistence: playerModel.persistence * 100,
+          confidence: playerModel.confidence * 100,
+          time: new Date().toLocaleTimeString(),
+        },
+      ]);
     }, 15000);
     return () => clearInterval(interval);
   }, [playerModel]);
@@ -111,32 +397,54 @@ export default function App() {
   // --- Adaptive Learning Path ---
   const nextRecommendedLevel = useMemo(() => {
     if (!decision) return LEVEL_POOL.find(l => !completedLevels.includes(l.id)) || null;
-    return selectNextLevel(decision, playerModel, LEVEL_POOL, completedLevels);
-  }, [decision, playerModel, completedLevels]);
+    return selectNextLevel(decision, playerModel, LEVEL_POOL, completedLevels, currentLevel);
+  }, [decision, playerModel, completedLevels, currentLevel]);
 
   const startLevel = (levelId: string) => {
     setCurrentLevelId(levelId);
-    setBlocks([]); setBlocksHistory([]); setIsSuccess(false); setXaiFeedback(null);
+    setBlocks([]); setBlocksHistory([]); setIsSuccess(false); setXaiFeedback(null); setXaiResult(null);
     setView('student');
     logEvent('SESSION_START', { levelId, target: LEVEL_POOL.find(l => l.id === levelId)?.name });
   };
 
-  // --- Explainable AI Trigger (啟動 AI Tutor) ---
-  const requestTutor = () => {
-    logEvent('HINT_REQUEST', {});
-    const { features, diags, dec } = runPipeline(logs);
-    const feedback = generateXAI(diags, dec, features, playerModel);
+  // --- Explainable AI Trigger ---
+  const requestTutor = (): void => {
+    const { updatedLogs } = appendEvent('HINT_REQUEST', {
+      levelId: currentLevel.id,
+      requestedAt: Date.now(),
+    });
 
-    // 若為結構性提示，補充具體座標（沿用平移比對演算法，使提示可操作化）
-    if (dec.hintType === 'STRUCTURAL' || dec.hintType === 'PLANNING') {
+    const pipeline = runPipeline(updatedLogs, {
+      generateFeedback: true,
+    });
+
+    // 將幾何差異加入學生可操作提示
+    if (
+      pipeline.decision.hintType === 'STRUCTURAL' ||
+      pipeline.decision.hintType === 'PLANNING'
+    ) {
       const geo = computeGeometricDiff();
-      if (geo.extraneous) {
-        feedback.hint = `請移除位於 (${geo.extraneous.x}, ${geo.extraneous.y}, ${geo.extraneous.z}) 的方塊，這裡不屬於目標結構。` + ' ' + feedback.hint;
-      } else if (geo.missing) {
-        feedback.hint = `你還需要在 (${geo.missing.x}, ${geo.missing.z}) 的高度 ${geo.missing.y} 補上一個方塊。` + ' ' + feedback.hint;
-      }
+
+      setXaiFeedback(previous => {
+        if (!previous) return previous;
+
+        let coordinateHint = '';
+
+        if (geo.extraneous) {
+          coordinateHint =
+            `請先檢查位於 (${geo.extraneous.x}, ${geo.extraneous.y}, ${geo.extraneous.z}) 的方塊；` +
+            '它可能不屬於目標結構。 ';
+        } else if (geo.missing) {
+          coordinateHint =
+            `請檢查座標 (${geo.missing.x}, ${geo.missing.z})、高度 ${geo.missing.y} 是否缺少方塊。 `;
+        }
+
+        return {
+          ...previous,
+          hint: coordinateHint + previous.hint,
+        };
+      });
     }
-    setXaiFeedback(feedback);
   };
 
   /** 平移不變式比對：找出目前建構與目標模型之間第一個差異方塊（沿用原始演算法邏輯） */
@@ -192,17 +500,163 @@ export default function App() {
     }
     if (isMatch) {
       setIsSuccess(true);
-      const nextCompleted = completedLevels.includes(currentLevelId) ? completedLevels : [...completedLevels, currentLevelId];
-      if (!completedLevels.includes(currentLevelId)) setCompletedLevels(nextCompleted);
-      logEvent('SUBMIT', { success: true });
+
+      const nextCompleted = completedLevels.includes(currentLevelId)
+        ? completedLevels
+        : [...completedLevels, currentLevelId];
+
+      if (!completedLevels.includes(currentLevelId)) {
+        setCompletedLevels(nextCompleted);
+      }
+
+      const { event, updatedLogs } = appendEvent('SUBMIT', {
+        success: true,
+        completed: true,
+        levelId: currentLevel.id,
+        completionRate: 1,
+        currentBlocks: currentBlocks.length,
+        targetBlocks: currentLevel.targets.length,
+      });
+
+      const observations = createLevelKnowledgeObservations({
+        primarySkill: currentLevel.primarySkill,
+        secondarySkills: ['planning', 'workingMemory'],
+        success: true,
+        difficulty: currentLevel.difficulty,
+        hintUsed: behaviorFeatures.hintRequestCount > 0,
+        hintLevel:
+          behaviorFeatures.hintRequestCount >= 3
+            ? 3
+            : behaviorFeatures.hintRequestCount === 2
+              ? 2
+              : behaviorFeatures.hintRequestCount === 1
+                ? 1
+                : 0,
+        completionRate: 1,
+        score: 1,
+        levelId: currentLevel.id,
+        observationId: event.id,
+        timestamp: event.timestamp,
+      });
+
+      runPipeline(updatedLogs, {
+        knowledgeObservations: observations,
+        generateFeedback: true,
+        levelCompleted: true,
+      });
+
       if (nextCompleted.length === LEVEL_POOL.length) {
-        setTimeout(() => setView('post-assessment'), 800);
+        window.setTimeout(
+          () => setView('post-assessment'),
+          800,
+        );
       }
     }
   };
 
   const handleReflectionAnswered = (question: string, answer: string) => {
-    logEvent('REFLECTION_ANSWER', { question, answer });
+    logEvent('REFLECTION_ANSWER', {
+      question,
+      answer,
+      answerLength: answer.length,
+      levelId: currentLevel.id,
+    });
+  };
+
+  const handleApplyTutorHint = (
+    cycle: number,
+    hint: string,
+  ): void => {
+    logEvent('HINT_READ', {
+      cycle,
+      hint,
+      levelId: currentLevel.id,
+      readAt: Date.now(),
+    });
+  };
+
+  const handleTutorObservation = async (
+    payload: TutorObservationPayload,
+  ): Promise<void> => {
+    setIsTutorReassessing(true);
+
+    try {
+      const success = payload.result === 'SUCCESS';
+      const eventType: EventType = success
+        ? 'PLACE_SUCCESS'
+        : payload.result === 'STILL_STUCK'
+          ? 'ERROR'
+          : 'SUBMIT';
+
+      const { event, updatedLogs } = appendEvent(
+        eventType,
+        {
+          tutorCycle: payload.cycle,
+          tutorObservation: payload.result,
+          reflectionAnswer: payload.reflectionAnswer,
+          diagnosisRuleId: payload.diagnosis?.ruleId,
+          success,
+          partial: payload.result === 'PARTIAL',
+          completed: success,
+          levelId: currentLevel.id,
+        },
+      );
+
+      const preliminaryFeatures =
+        extractFeatures(updatedLogs);
+
+      const observations =
+        createLevelKnowledgeObservations({
+          primarySkill:
+            currentLevel.primarySkill,
+          secondarySkills: [
+            'planning',
+            'workingMemory',
+          ],
+          success,
+          difficulty:
+            currentLevel.difficulty,
+          hintUsed: true,
+          hintLevel:
+            payload.cycle >= 3
+              ? 3
+              : payload.cycle === 2
+                ? 2
+                : 1,
+          completionRate:
+            success
+              ? 1
+              : preliminaryFeatures.completionRate,
+          score:
+            success
+              ? 1
+              : preliminaryFeatures.successRate,
+          levelId:
+            currentLevel.id,
+          observationId:
+            event.id,
+          timestamp:
+            event.timestamp,
+        });
+
+      runPipeline(updatedLogs, {
+        knowledgeObservations:
+          observations,
+        generateFeedback: true,
+        levelCompleted: success,
+      });
+    } finally {
+      setIsTutorReassessing(false);
+    }
+  };
+
+  const handleNextTask = (): void => {
+    if (!nextRecommendedLevel) {
+      setView('path');
+      return;
+    }
+
+    startLevel(nextRecommendedLevel.id);
   };
 
   // --- Research Export ---
@@ -340,9 +794,15 @@ export default function App() {
               </div>
               <TutorPanel
                 xaiFeedback={xaiFeedback}
+                xaiResult={xaiResult}
                 topDiagnosis={diagnoses[0]}
                 fallbackAbility={currentLevel.primarySkill}
+                isReassessing={isTutorReassessing}
+                maxCycles={3}
                 onReflectionAnswered={handleReflectionAnswered}
+                onApplyHint={handleApplyTutorHint}
+                onObservationSubmitted={handleTutorObservation}
+                onNextTask={handleNextTask}
               />
             </div>
           </div>
@@ -356,7 +816,7 @@ export default function App() {
             <div className="flex justify-between items-end bg-white p-6 rounded-xl shadow-sm border border-slate-200">
               <div>
                 <h2 className="text-2xl font-bold text-slate-800 flex items-center"><BarChart3 className="w-6 h-6 mr-2 text-indigo-600" /> 學習分析儀表板 (Learning Analytics)</h2>
-                <p className="text-slate-500 mt-1">完整呈現 Event → Feature → Pattern → Diagnosis → Player Model → Decision → XAI 資料流。</p>
+                <p className="text-slate-500 mt-1">完整呈現 Event → Feature → Behavior Vector → Probability Diagnosis → Knowledge Tracing → ML Player Model → Decision Table → XAI 資料流。</p>
               </div>
               <div className="flex space-x-2">
                 <button onClick={handleExportEvents} className="bg-indigo-50 border border-indigo-200 text-indigo-700 px-4 py-2 rounded-lg font-bold shadow-sm hover:bg-indigo-100 flex items-center space-x-2 transition-colors">
@@ -377,21 +837,22 @@ export default function App() {
             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
               <h3 className="font-bold text-slate-800 mb-4 flex items-center"><GitBranch className="w-5 h-5 mr-2 text-indigo-500" /> AI 推理鏈 (Behavior Reasoning Pipeline)</h3>
               <div className="flex flex-wrap items-stretch gap-2 text-xs">
-                {['Event Log', 'Feature Extraction', 'Pattern Recognition', 'Cognitive Diagnosis', 'Player Model Update', 'Adaptive Decision', 'Explainable AI'].map((stage, i) => (
+                {['Event Log', 'Feature Extraction', 'Behavior Vector', 'Probability Diagnosis', 'Knowledge Tracing', 'ML Player Model', 'Decision Table', 'Explainable AI'].map((stage, i) => (
                   <React.Fragment key={stage}>
                     <div className="flex-1 min-w-[110px] bg-indigo-50 border border-indigo-100 rounded-lg p-3 text-center">
                       <div className="font-bold text-indigo-700">{stage}</div>
                       <div className="text-indigo-400 mt-1">
                         {i === 0 && `${logs.length} 筆`}
                         {i === 1 && `${Object.keys(behaviorFeatures).length} 維特徵`}
-                        {i === 2 && `${patterns.length} 個模式`}
+                        {i === 2 && `${Object.keys(behaviorVector).length} 維向量`}
                         {i === 3 && `${diagnoses.length} 項診斷`}
-                        {i === 4 && `${evidenceTrail.length} 條證據`}
-                        {i === 5 && (decision ? decision.ruleId : '—')}
-                        {i === 6 && (xaiFeedback ? '已產生' : '待觸發')}
+                        {i === 4 && `${knowledgeState.totalObservations} 次更新`}
+                        {i === 5 && `${modelPredictions.length} 項推論`}
+                        {i === 6 && (decision ? decision.ruleId : '—')}
+                        {i === 7 && (xaiFeedback ? '已產生' : '待觸發')}
                       </div>
                     </div>
-                    {i < 6 && <div className="flex items-center text-slate-300">→</div>}
+                    {i < 7 && <div className="flex items-center text-slate-300">→</div>}
                   </React.Fragment>
                 ))}
               </div>
@@ -400,20 +861,26 @@ export default function App() {
             {/* Behavior Pattern & Cognitive Diagnosis */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                <h3 className="font-bold text-slate-800 mb-4">Behavior Pattern Recognition</h3>
-                {patterns.length === 0 ? <p className="text-sm text-slate-400">尚未偵測到明顯行為模式。</p> : (
-                  <div className="space-y-2">
-                    {patterns.map(p => (
-                      <div key={p.id} className="border border-slate-100 rounded-lg p-3 bg-slate-50">
-                        <div className="flex justify-between items-center">
-                          <span className="font-bold text-sm text-slate-700">{p.name}</span>
-                          <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded font-mono">{(p.strength * 100).toFixed(0)}%</span>
-                        </div>
-                        <p className="text-xs text-slate-500 mt-1">{p.description}</p>
+                <h3 className="font-bold text-slate-800 mb-4">
+                  Behavior Vector Recognition
+                </h3>
+                <div className="grid grid-cols-2 gap-3">
+                  {(Object.entries(behaviorVector) as Array<[string, number]>).map(([key, value]) => (
+                    <div
+                      key={key}
+                      className="border border-slate-100 rounded-lg p-3 bg-slate-50"
+                    >
+                      <div className="flex justify-between items-center gap-2">
+                        <span className="font-bold text-xs text-slate-700">
+                          {key}
+                        </span>
+                        <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded font-mono">
+                          {(value * 100).toFixed(0)}%
+                        </span>
                       </div>
-                    ))}
-                  </div>
-                )}
+                    </div>
+                  ))}
+                </div>
               </div>
               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
                 <h3 className="font-bold text-slate-800 mb-4">Cognitive Diagnosis Engine</h3>
@@ -433,27 +900,96 @@ export default function App() {
               </div>
             </div>
 
-            {/* Player Model Update Evidence Trail */}
+            {/* Machine Learning Player Model Evidence */}
             <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-              <h3 className="font-bold text-slate-800 mb-4">Player Model Update — 公式化證據追蹤</h3>
-              {evidenceTrail.length === 0 ? <p className="text-sm text-slate-400">尚無更新紀錄。</p> : (
+              <h3 className="font-bold text-slate-800 mb-4">
+                Machine Learning Player Model — 推論證據
+              </h3>
+              {modelPredictions.length === 0 ? (
+                <p className="text-sm text-slate-400">尚無模型推論紀錄。</p>
+              ) : (
                 <div className="overflow-x-auto">
                   <table className="w-full text-xs text-left">
                     <thead>
                       <tr className="text-slate-400 border-b border-slate-100">
-                        <th className="py-2 pr-4">能力</th><th className="py-2 pr-4">公式</th><th className="py-2 pr-4">變化</th>
+                        <th className="py-2 pr-4">指標</th>
+                        <th className="py-2 pr-4">公式</th>
+                        <th className="py-2 pr-4">變化</th>
+                        <th className="py-2 pr-4">信心</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {evidenceTrail.map((e, i) => (
-                        <tr key={i} className="border-b border-slate-50">
-                          <td className="py-2 pr-4 font-bold text-slate-700">{ABILITY_LABEL_MAP[e.ability] || e.ability}</td>
-                          <td className="py-2 pr-4 font-mono text-slate-500">{e.formula}</td>
-                          <td className={`py-2 pr-4 font-mono ${e.delta >= 0 ? 'text-green-600' : 'text-red-600'}`}>{e.before.toFixed(1)} → {e.after.toFixed(1)} ({e.delta >= 0 ? '+' : ''}{e.delta.toFixed(1)})</td>
+                      {modelPredictions.map(prediction => (
+                        <tr
+                          key={prediction.metric}
+                          className="border-b border-slate-50"
+                        >
+                          <td className="py-2 pr-4 font-bold text-slate-700">
+                            {ABILITY_LABEL_MAP[prediction.metric] ?? prediction.metric}
+                          </td>
+                          <td className="py-2 pr-4 font-mono text-slate-500 max-w-[420px]">
+                            {prediction.formula}
+                          </td>
+                          <td
+                            className={`py-2 pr-4 font-mono ${
+                              prediction.delta >= 0
+                                ? 'text-green-600'
+                                : 'text-red-600'
+                            }`}
+                          >
+                            {(prediction.previousValue * 100).toFixed(1)} →{' '}
+                            {(prediction.updatedValue * 100).toFixed(1)}
+                            {' '}
+                            ({prediction.delta >= 0 ? '+' : ''}
+                            {(prediction.delta * 100).toFixed(1)})
+                          </td>
+                          <td className="py-2 pr-4 font-mono text-indigo-600">
+                            {(prediction.confidence * 100).toFixed(0)}%
+                          </td>
                         </tr>
                       ))}
                     </tbody>
                   </table>
+                </div>
+              )}
+            </div>
+
+            {/* Knowledge Tracing Evidence */}
+            <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
+              <h3 className="font-bold text-slate-800 mb-4">
+                Knowledge Tracing — 知識掌握追蹤
+              </h3>
+              <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-4">
+                {ABILITY_KEYS.map(ability => {
+                  const skill = knowledgeState.skills[ability];
+                  return (
+                  <div
+                    key={skill.ability}
+                    className="bg-slate-50 border border-slate-100 rounded-lg p-3"
+                  >
+                    <div className="text-[11px] font-bold text-slate-500">
+                      {ABILITY_LABEL_MAP[skill.ability]}
+                    </div>
+                    <div className="text-xl font-black text-slate-700 mt-1">
+                      {(skill.mastery * 100).toFixed(0)}%
+                    </div>
+                    <div className="text-[10px] text-slate-400 mt-1">
+                      {skill.trend} · {skill.observations} 次
+                    </div>
+                  </div>
+                  );
+                })}
+              </div>
+              {knowledgeEvidence.length > 0 && (
+                <div className="space-y-2">
+                  {knowledgeEvidence.map(item => (
+                    <div
+                      key={`${item.ability}-${item.updatedMastery}`}
+                      className="text-xs bg-indigo-50 border border-indigo-100 text-indigo-800 rounded-lg p-3"
+                    >
+                      {item.explanation}
+                    </div>
+                  ))}
                 </div>
               )}
             </div>
@@ -465,6 +1001,13 @@ export default function App() {
                 <div className="bg-slate-50 border border-slate-100 rounded-lg p-4 text-sm font-mono text-slate-700">
                   <div>{decision.ruleId}: {decision.condition}</div>
                   <div className="text-indigo-600 mt-1">{decision.action}</div>
+                  {decisionResult && (
+                    <div className="text-slate-500 mt-2">
+                      Priority {decisionResult.selectedRule.priority} ·
+                      Matching Score{' '}
+                      {(decisionResult.selectedRule.matchingScore * 100).toFixed(0)}%
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -490,17 +1033,17 @@ export default function App() {
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
               <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 md:col-span-1 relative">
-                <div className="absolute top-6 right-6 bg-green-100 text-green-700 text-xs font-bold px-2 py-1 rounded border border-green-200">系統信心指數: {playerModel.confidence.toFixed(0)}%</div>
+                <div className="absolute top-6 right-6 bg-green-100 text-green-700 text-xs font-bold px-2 py-1 rounded border border-green-200">模型推論信心: {(playerModelConfidence * 100).toFixed(0)}%</div>
                 <h3 className="font-bold text-slate-800 mb-4 flex items-center"><User className="w-5 h-5 mr-2 text-purple-600" /> 特徵驅動玩家模型</h3>
                 <div className="h-64 w-full">
                   <ResponsiveContainer width="100%" height="100%">
                     <RadarChart cx="50%" cy="50%" outerRadius="65%" data={[
-                      { subject: '心理旋轉', A: playerModel.mentalRotation, fullMark: 100 },
-                      { subject: '空間視覺', A: playerModel.spatialVisualization, fullMark: 100 },
-                      { subject: '視角轉換', A: playerModel.perspectiveTaking, fullMark: 100 },
-                      { subject: '邏輯規劃', A: playerModel.planning, fullMark: 100 },
-                      { subject: '工作記憶', A: playerModel.workingMemory, fullMark: 100 },
-                      { subject: '堅持度', A: playerModel.persistence, fullMark: 100 },
+                      { subject: '心理旋轉', A: playerModel.mentalRotation * 100, fullMark: 100 },
+                      { subject: '空間視覺', A: playerModel.spatialVisualization * 100, fullMark: 100 },
+                      { subject: '視角轉換', A: playerModel.perspectiveTaking * 100, fullMark: 100 },
+                      { subject: '邏輯規劃', A: playerModel.planning * 100, fullMark: 100 },
+                      { subject: '工作記憶', A: playerModel.workingMemory * 100, fullMark: 100 },
+                      { subject: '堅持度', A: playerModel.persistence * 100, fullMark: 100 },
                     ]}>
                       <PolarGrid stroke="#e2e8f0" />
                       <PolarAngleAxis dataKey="subject" tick={{ fill: '#475569', fontSize: 11, fontWeight: 'bold' }} />
