@@ -15,6 +15,12 @@ import {
   TutorPanel,
   TutorObservationPayload,
 } from './components/TutorPanel';
+import AbilityTrendChart from './components/analytics/AbilityTrendChart';
+import EventTimeline from './components/analytics/EventTimeline';
+import HintEffectPanel from './components/analytics/HintEffectPanel';
+import DecisionHistoryPanel from './components/analytics/DecisionHistoryPanel';
+import PlayerModelSnapshotTable from './components/analytics/PlayerModelSnapshotTable';
+import KnowledgeEvolutionTimeline from './components/analytics/KnowledgeEvolutionTimeline';
 import { LEVEL_POOL } from './data/levels';
 import {
   Block,
@@ -40,6 +46,7 @@ import {
   TutorSelfReportedResult,
   ResearchSessionData,
   Position,
+  AdaptiveDecisionHistoryEntry,
 } from './types';
 
 import { extractFeatures } from './engines/behaviorFeatureExtractor';
@@ -248,6 +255,7 @@ interface PipelineOptions {
   triggerType?: PlayerModelSnapshotTrigger;
   analysisLogs?: EventLog[];
   interventionId?: string;
+  interventionOutcome?: TutorObjectiveResult;
 }
 
 export default function App() {
@@ -295,6 +303,8 @@ export default function App() {
   const [isTutorReassessing, setIsTutorReassessing] = useState(false);
   const [playerModelHistory, setPlayerModelHistory] =
     useState<PlayerModelSnapshot[]>([]);
+  const [decisionHistory, setDecisionHistory] =
+    useState<AdaptiveDecisionHistoryEntry[]>([]);
   const [activeTutorIntervention, setActiveTutorIntervention] =
     useState<TutorInterventionWindow | null>(null);
   const [tutorInterventionHistory, setTutorInterventionHistory] =
@@ -471,6 +481,18 @@ export default function App() {
 
     setPlayerModelHistory(history => [...history, snapshot]);
 
+    const decisionHistoryEntry: AdaptiveDecisionHistoryEntry = {
+      id: createId(),
+      timestamp: snapshot.timestamp,
+      levelId: currentLevel.id,
+      decision: nextDecision,
+      diagnosisRuleIds: diags.map((diagnosis) => diagnosis.ruleId),
+      playerModelSnapshotId: snapshot.id,
+      interventionId: options.interventionId,
+      outcome: options.interventionOutcome,
+    };
+    setDecisionHistory((history) => [...history, decisionHistoryEntry]);
+
     if (options.generateFeedback) {
       const detailedXAI = generateDetailedXAI({
         diagnoses: diags,
@@ -628,6 +650,9 @@ export default function App() {
 
   // --- Interaction Wrappers ---
   const handleAddBlock = (x: number, y: number, z: number) => {
+    if (blocksRef.current.some((block) => block.x === x && block.y === y && block.z === z)) {
+      return;
+    }
     setBlocksHistory(prev => [...prev, blocks]);
     const allBlocks = [...blocks, { id: Math.random().toString(36).substr(2, 9), x, y, z, color: '#3b82f6' }];
     setBlocks(allBlocks);
@@ -873,6 +898,7 @@ export default function App() {
         triggerType: 'TUTOR_REASSESSMENT',
         analysisLogs: windowLogs.length > 0 ? windowLogs : updatedLogs,
         interventionId: completedIntervention.id,
+        interventionOutcome: outcome.result,
       });
     } finally {
       setIsTutorReassessing(false);
@@ -901,6 +927,7 @@ export default function App() {
       finalPlayerModel: playerModel,
       playerModelHistory,
       tutorInterventions: tutorInterventionHistory,
+      decisionHistory,
       completedLevelIds: completedLevels,
       metadata: { currentLevelId, playerModelConfidence },
     };
@@ -1326,6 +1353,52 @@ export default function App() {
                   </ResponsiveContainer>
                 </div>
               </div>
+            </div>
+
+            {/* Research Analytics Modules */}
+            <div className="space-y-6">
+              <div className="rounded-xl border border-indigo-100 bg-indigo-50/60 p-5">
+                <h3 className="font-bold text-indigo-900">研究型歷程分析模組</h3>
+                <p className="mt-1 text-sm text-indigo-700">
+                  以實際 Pipeline 更新、Tutor 介入、決策規則與 BKT 歷程支援 RQ2、RQ3 與 RQ4。
+                </p>
+              </div>
+
+              <AbilityTrendChart
+                snapshots={playerModelHistory}
+                title="1. Player Model History — 玩家模型演化"
+                maxPoints={40}
+              />
+
+              <PlayerModelSnapshotTable
+                snapshots={playerModelHistory}
+                title="Player Model Snapshot — 每次推理快照"
+                maxRows={60}
+              />
+
+              <HintEffectPanel
+                interventions={tutorInterventionHistory}
+                title="2. Tutor Intervention Analysis — 提示介入效果"
+              />
+
+              <DecisionHistoryPanel
+                decisions={decisionHistory}
+                snapshots={playerModelHistory}
+                interventions={tutorInterventionHistory}
+                title="3. Decision History — 自適應決策與後續效果"
+              />
+
+              <KnowledgeEvolutionTimeline
+                knowledgeState={knowledgeState}
+                title="4. Knowledge Evolution Timeline — 知識掌握演化"
+                maxPoints={50}
+              />
+
+              <EventTimeline
+                events={logs}
+                title="事件時間軸 — 提示前後與 Tutor Cycle 脈絡"
+                maxItems={100}
+              />
             </div>
 
             {/* Event Log Stream */}
